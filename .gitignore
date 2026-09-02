@@ -15,9 +15,14 @@ api_usage.json
 drive_sync.json
 artwork_meta.json
 collections.json
+*.bak
+
+# Logs
+*.log
 
 # Environment config
 .env
+*~
 
 # IDE / tools
 .playwright-mcp/
