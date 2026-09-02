@@ -255,22 +255,32 @@
   select:focus { box-shadow: var(--shadow-pop) var(--color-charcoal); outline: none; }
 
   .toolbar {
+    padding: var(--space-sm) var(--space-lg);
+    border-bottom: 2px solid var(--color-charcoal);
+  }
+
+  .toolbar-browse, .toolbar-selection {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: var(--space-sm) var(--space-lg);
-    border-bottom: 2px solid var(--color-charcoal);
     flex-wrap: wrap;
   }
 
   .toolbar .spacer { flex: 1; }
+
+  .toolbar-divider {
+    width: 1px;
+    align-self: stretch;
+    min-height: 24px;
+    background: var(--border);
+  }
 
   .selection-info {
     font-size: 13px;
     color: var(--text2);
   }
 
-  .collection-controls {
+  .collection-controls, .view-controls {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -986,6 +996,32 @@
     color: var(--text2);
     font-style: italic;
     cursor: default;
+  }
+
+  /* Slideshow settings dropdown */
+  .slideshow-menu {
+    padding: 12px;
+    min-width: 200px;
+  }
+  .slideshow-menu-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text2);
+    margin-bottom: 10px;
+  }
+  .slideshow-menu-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .slideshow-menu-checkbox {
+    justify-content: flex-start;
+  }
+  .slideshow-menu-play {
+    width: 100%;
   }
 
   /* Toast */
@@ -2076,6 +2112,45 @@
   .jump-to-current.highlight {
     animation: pulse-ring 0.8s ease-out;
   }
+
+  /* Slideshow status pill — always visible while a slideshow is running,
+     independent of the current collection filter */
+  .slideshow-status-pill {
+    position: fixed;
+    bottom: 24px;
+    left: 24px;
+    z-index: 150;
+    display: none;
+    align-items: center;
+    gap: 10px;
+    height: 40px;
+    padding: 0 8px 0 14px;
+    border-radius: 20px;
+    background: var(--text);
+    color: #fff;
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    white-space: nowrap;
+  }
+  .slideshow-status-pill.visible { display: flex; }
+  .slideshow-status-pill .slideshow-status-name {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .slideshow-status-pill button {
+    background: rgba(255,255,255,0.15);
+    border: none;
+    color: #fff;
+    font: inherit;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 14px;
+    cursor: pointer;
+  }
+  .slideshow-status-pill button:hover { background: rgba(255,255,255,0.28); }
 </style>
 </head>
 <body>
@@ -2131,37 +2206,68 @@
   </div>
 
   <div class="toolbar" id="toolbar">
-    <div class="collection-controls">
-      <select id="collectionFilter" aria-label="Filter by collection" onchange="filterByCollection(this.value)">
-        <option value="">All Artwork</option>
-      </select>
-      <button class="btn-icon" onclick="createCollection()" title="New collection">+</button>
-      <button class="btn-icon" id="btnSlideshowToggle" onclick="toggleSlideshow()" title="Select a collection to play as slideshow" disabled>&#9654;</button>
+    <div class="toolbar-browse" id="toolbarBrowse">
+      <div class="collection-controls">
+        <select id="collectionFilter" aria-label="Filter by collection" onchange="filterByCollection(this.value)">
+          <option value="">All Artwork</option>
+        </select>
+        <button class="btn-icon" onclick="createCollection()" title="New collection">+</button>
+        <div class="collection-dropdown" id="slideshowDropdown">
+          <button id="btnSlideshowToggle" onclick="toggleSlideshowMenu(event)" title="Select a collection to enable slideshow" disabled>&#9654; Slideshow &#9662;</button>
+          <div class="collection-dropdown-menu slideshow-menu" id="slideshowMenu">
+            <div class="slideshow-menu-title" id="slideshowMenuTitle">Play as slideshow</div>
+            <label class="slideshow-menu-row">
+              <span>Interval</span>
+              <select id="slideshowInterval" aria-label="Slideshow interval">
+                <option value="30">30s</option>
+                <option value="60">1m</option>
+                <option value="120">2m</option>
+                <option value="300" selected>5m</option>
+                <option value="900">15m</option>
+                <option value="1800">30m</option>
+                <option value="3600">1h</option>
+              </select>
+            </label>
+            <label class="slideshow-menu-row slideshow-menu-checkbox">
+              <input type="checkbox" id="slideshowShuffle"> <span>Shuffle</span>
+            </label>
+            <button class="primary slideshow-menu-play" onclick="startSlideshow()">&#9654; Play</button>
+          </div>
+        </div>
+      </div>
+      <div class="toolbar-divider"></div>
+      <div class="view-controls">
+        <div class="zoom-control">
+          <button onclick="zoomOut()" aria-label="Smaller thumbnails" style="background:none;border:none;font:inherit;color:inherit;padding:0">&minus;</button>
+          <input type="range" id="zoomSlider" min="120" max="400" value="220" step="20"
+                 oninput="setZoom(this.value)" aria-label="Thumbnail size">
+          <button onclick="zoomIn()" aria-label="Larger thumbnails" style="background:none;border:none;font:inherit;color:inherit;padding:0">+</button>
+        </div>
+        <select id="sortSelect" aria-label="Sort artwork by" onchange="setSort(this.value)">
+          <option value="none">Unsorted</option>
+          <option value="title">Title</option>
+          <option value="artist">Artist</option>
+          <option value="year">Year</option>
+          <option value="school">School</option>
+          <option value="medium">Medium</option>
+          <option value="date_added">Date Added</option>
+        </select>
+      </div>
+      <div class="spacer"></div>
+      <button id="btnSelectMode" onclick="toggleSelectMode()" title="Select multiple artworks">Select</button>
+      <button onclick="refreshArt()" title="Refresh artwork list from TV">Refresh</button>
     </div>
-    <button id="btnSelectMode" onclick="toggleSelectMode()" title="Toggle artwork selection mode">Select</button>
-    <span class="selection-info" id="selectionInfo"></span>
-    <div class="zoom-control">
-      <button onclick="zoomOut()" aria-label="Smaller thumbnails" style="background:none;border:none;font:inherit;color:inherit;padding:0">&minus;</button>
-      <input type="range" id="zoomSlider" min="120" max="400" value="220" step="20"
-             oninput="setZoom(this.value)" aria-label="Thumbnail size">
-      <button onclick="zoomIn()" aria-label="Larger thumbnails" style="background:none;border:none;font:inherit;color:inherit;padding:0">+</button>
+
+    <div class="toolbar-selection" id="toolbarSelection" style="display:none">
+      <button onclick="toggleSelectMode()" title="Exit selection mode">Cancel</button>
+      <span class="selection-info" id="selectionInfo"></span>
+      <div class="spacer"></div>
+      <div class="collection-dropdown" id="addToCollectionDropdown">
+        <button onclick="toggleCollectionDropdown()" title="Add selected artwork to a collection">Add to Collection</button>
+        <div class="collection-dropdown-menu" id="collectionDropdownMenu"></div>
+      </div>
+      <button id="btnDeleteSelected" class="danger" onclick="deleteSelected()" title="Delete all selected artwork from Frame">Delete Selected</button>
     </div>
-    <select id="sortSelect" aria-label="Sort artwork by" onchange="setSort(this.value)">
-      <option value="none">Unsorted</option>
-      <option value="title">Title</option>
-      <option value="artist">Artist</option>
-      <option value="year">Year</option>
-      <option value="school">School</option>
-      <option value="medium">Medium</option>
-      <option value="date_added">Date Added</option>
-    </select>
-    <div class="spacer"></div>
-    <div class="collection-dropdown" id="addToCollectionDropdown" style="display:none">
-      <button onclick="toggleCollectionDropdown()" title="Add selected artwork to a collection">Add to Collection</button>
-      <div class="collection-dropdown-menu" id="collectionDropdownMenu"></div>
-    </div>
-    <button id="btnDeleteSelected" class="danger" style="display:none" onclick="deleteSelected()" title="Delete all selected artwork from Frame">Delete Selected</button>
-    <button onclick="refreshArt()" title="Refresh artwork list from TV">Refresh</button>
   </div>
 
   <div class="group-nav" id="groupNav"></div>
@@ -3398,9 +3504,8 @@
       selectMode = !selectMode;
       selectedIds.clear();
       document.getElementById('artGrid').classList.toggle('select-mode', selectMode);
-      document.getElementById('btnSelectMode').textContent = selectMode ? 'Cancel' : 'Select';
-      document.getElementById('btnDeleteSelected').style.display = selectMode ? '' : 'none';
-      document.getElementById('addToCollectionDropdown').style.display = selectMode ? '' : 'none';
+      document.getElementById('toolbarBrowse').style.display = selectMode ? 'none' : '';
+      document.getElementById('toolbarSelection').style.display = selectMode ? 'flex' : 'none';
       updateSelectionInfo();
       renderGrid();
     }
@@ -3718,36 +3823,63 @@
       updateSlideshowButton();
     }
 
-    function updateSlideshowButton() {
-      const btn = document.getElementById('btnSlideshowToggle');
-      const selectedId = document.getElementById('collectionFilter').value;
-      if (!selectedId) {
-        btn.disabled = true;
-        btn.innerHTML = '&#9654;';
-        btn.title = 'Select a collection to play as slideshow';
+    function toggleSlideshowMenu(event) {
+      event?.stopPropagation();
+      const menu = document.getElementById('slideshowMenu');
+      if (menu.classList.contains('open')) {
+        menu.classList.remove('open');
         return;
       }
-      btn.disabled = false;
-      const isThisPlaying = slideshowStatus.running && slideshowStatus.collection_id === selectedId;
-      btn.innerHTML = isThisPlaying ? '&#9632;' : '&#9654;';
-      btn.title = isThisPlaying ? 'Stop slideshow' : 'Play this collection as a slideshow';
-    }
-
-    async function toggleSlideshow() {
       const selectedId = document.getElementById('collectionFilter').value;
       if (!selectedId) return;
-      const isThisPlaying = slideshowStatus.running && slideshowStatus.collection_id === selectedId;
+      const c = collections.find(c => c.id === selectedId);
+      document.getElementById('slideshowMenuTitle').textContent =
+        c ? `Play "${c.name}" as slideshow` : 'Play as slideshow';
+      menu.classList.add('open');
+    }
+
+    async function startSlideshow() {
+      const selectedId = document.getElementById('collectionFilter').value;
+      if (!selectedId) return;
+      const interval = parseInt(document.getElementById('slideshowInterval').value, 10);
+      const shuffle = document.getElementById('slideshowShuffle').checked;
       try {
-        if (isThisPlaying) {
-          await api('/slideshow-stop', { method: 'POST' });
-          toast('Slideshow stopped', 'success');
-        } else {
-          await api(`/collections/${selectedId}/play`, { method: 'POST', body: {} });
-          toast('Slideshow started', 'success');
-        }
+        await api(`/collections/${selectedId}/play`, { method: 'POST', body: { interval, shuffle } });
+        toast('Slideshow started', 'success');
+        document.getElementById('slideshowMenu').classList.remove('open');
         await pollSlideshowStatus();
       } catch (e) {
         toast('Failed: ' + e.message, 'error');
+      }
+    }
+
+    async function stopSlideshowGlobal() {
+      try {
+        await api('/slideshow-stop', { method: 'POST' });
+        toast('Slideshow stopped', 'success');
+        await pollSlideshowStatus();
+      } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+      }
+    }
+
+    // Reflects background slideshow state (which may belong to a different
+    // collection than the one currently filtered) in the toolbar button and
+    // the persistent status pill.
+    function updateSlideshowButton() {
+      const btn = document.getElementById('btnSlideshowToggle');
+      const selectedId = document.getElementById('collectionFilter').value;
+      btn.disabled = !selectedId;
+      btn.title = selectedId ? 'Slideshow settings' : 'Select a collection to enable slideshow';
+
+      const pill = document.getElementById('slideshowStatusPill');
+      if (slideshowStatus.running) {
+        pill.classList.add('visible');
+        const pos = (slideshowStatus.index ?? 0) + 1;
+        document.getElementById('slideshowStatusName').textContent =
+          `Playing "${slideshowStatus.collection_name}" (${pos}/${slideshowStatus.total})`;
+      } else {
+        pill.classList.remove('visible');
       }
     }
 
@@ -4715,11 +4847,15 @@
       loadArt();
     }
 
-    // Close dropdown when clicking outside
+    // Close dropdowns when clicking outside
     document.addEventListener('click', e => {
       const dd = document.getElementById('addToCollectionDropdown');
       if (!dd.contains(e.target)) {
         document.getElementById('collectionDropdownMenu').classList.remove('open');
+      }
+      const sd = document.getElementById('slideshowDropdown');
+      if (!sd.contains(e.target)) {
+        document.getElementById('slideshowMenu').classList.remove('open');
       }
     });
 
@@ -5392,5 +5528,11 @@
     init();
   </script>
   <button class="jump-to-current" id="jumpToCurrentFab" title="Scroll to the artwork currently on your TV" onclick="scrollToCurrentCard()"><span class="fab-icon">▶</span><span class="fab-label">Now showing</span></button>
+
+  <div class="slideshow-status-pill" id="slideshowStatusPill">
+    <span>&#9654;</span>
+    <span class="slideshow-status-name" id="slideshowStatusName"></span>
+    <button onclick="stopSlideshowGlobal()">Stop</button>
+  </div>
 </body>
 </html>
