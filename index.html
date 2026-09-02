@@ -121,6 +121,13 @@
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
+    /* The compact header toggle below shrinks the sticky header's height,
+       an in-flow layout shift near the top of the page. Browser scroll
+       anchoring then "helpfully" adjusts scrollY to compensate, which
+       crosses the 40/120px hysteresis thresholds in the scroll handler and
+       re-triggers the opposite toggle — an infinite bounce. Disable
+       anchoring so scrollY only moves from actual user scrolling. */
+    overflow-anchor: none;
   }
 
   header {
