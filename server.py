@@ -131,6 +131,7 @@ _slideshow_state: dict = {
     "interval": 0,
     "shuffle": False,
     "started": None,
+    "changed_at": None,
 }
 _SLIDESHOW_MAX_FAILURES = 5  # consecutive select_image failures before auto-stop
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -1103,6 +1104,7 @@ async def _run_slideshow(collection_id: str, content_ids: list[str], interval: f
                     _current_id_cache = cid
                     _slideshow_state["current_id"] = cid
                     _slideshow_state["index"] = i
+                    _slideshow_state["changed_at"] = datetime.now(timezone.utc).isoformat()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -1162,6 +1164,7 @@ async def play_collection(collection_id: str, body: dict):
         "interval": interval,
         "shuffle": shuffle,
         "started": datetime.now(timezone.utc).isoformat(),
+        "changed_at": datetime.now(timezone.utc).isoformat(),
     })
     _slideshow_task = asyncio.create_task(
         _run_slideshow(collection_id, content_ids, interval, shuffle)

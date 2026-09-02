@@ -2140,6 +2140,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .slideshow-status-pill .slideshow-status-countdown {
+    color: rgba(255,255,255,0.65);
+    font-variant-numeric: tabular-nums;
+  }
   .slideshow-status-pill button {
     background: rgba(255,255,255,0.15);
     border: none;
@@ -2913,6 +2917,7 @@
       loadCollections();
       pollSlideshowStatus();
       setInterval(pollSlideshowStatus, 5000);
+      setInterval(updateSlideshowCountdown, 1000);
 
       const savedZoom = localStorage.getItem('thumbZoom');
       if (savedZoom) setZoom(parseInt(savedZoom));
@@ -3881,6 +3886,22 @@
       } else {
         pill.classList.remove('visible');
       }
+      updateSlideshowCountdown();
+    }
+
+    // Ticks every second between polls so the "next in" time counts down
+    // smoothly instead of jumping only when pollSlideshowStatus() runs.
+    function updateSlideshowCountdown() {
+      const el = document.getElementById('slideshowStatusCountdown');
+      if (!slideshowStatus.running || !slideshowStatus.changed_at || !slideshowStatus.interval) {
+        el.textContent = '';
+        return;
+      }
+      const elapsed = (Date.now() - new Date(slideshowStatus.changed_at).getTime()) / 1000;
+      const remaining = Math.max(0, Math.ceil(slideshowStatus.interval - elapsed));
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      el.textContent = `· next in ${mins}:${String(secs).padStart(2, '0')}`;
     }
 
     async function pollSlideshowStatus() {
@@ -5532,6 +5553,7 @@
   <div class="slideshow-status-pill" id="slideshowStatusPill">
     <span>&#9654;</span>
     <span class="slideshow-status-name" id="slideshowStatusName"></span>
+    <span class="slideshow-status-countdown" id="slideshowStatusCountdown"></span>
     <button onclick="stopSlideshowGlobal()">Stop</button>
   </div>
 </body>
