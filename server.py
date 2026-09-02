@@ -526,17 +526,20 @@ async def refresh_art():
 
 # --- Thumbnails (disk-cached) ---
 
+_THUMB_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
+
+
 @app.get("/api/thumbnail/{content_id}")
 async def get_thumbnail(content_id: str):
     _validate_content_id(content_id)
     cached = _get_cached_thumbnail(content_id)
     if cached:
-        return Response(content=cached, media_type="image/jpeg")
+        return Response(content=cached, media_type="image/jpeg", headers=_THUMB_CACHE_HEADERS)
     data = await _tv_op(lambda art: art.get_thumbnail(content_id))
     if not data:
         raise HTTPException(404, "No thumbnail")
     _save_thumbnail(content_id, data)
-    return Response(content=bytes(data), media_type="image/jpeg")
+    return Response(content=bytes(data), media_type="image/jpeg", headers=_THUMB_CACHE_HEADERS)
 
 
 # Background thumbnail prefetch — tracks IDs already being fetched so
@@ -804,7 +807,10 @@ async def select_art(body: dict):
     if not content_id:
         raise HTTPException(400, "content_id required")
     _validate_content_id(content_id)
-    await _tv_op(lambda art: art.select_image(content_id, show=True))
+    try:
+        await _tv_op(lambda art: art.select_image(content_id, show=True))
+    except Exception:
+        raise HTTPException(502, "Cannot reach TV — is it on and connected?")
     _current_id_cache = content_id
     return {"ok": True, "content_id": content_id}
 
@@ -941,7 +947,10 @@ async def delete_art(body: dict):
     if not content_ids:
         raise HTTPException(400, "content_ids required")
     _validate_content_ids(content_ids)
-    ok = await _tv_op(lambda art: art.delete_list(content_ids))
+    try:
+        ok = await _tv_op(lambda art: art.delete_list(content_ids))
+    except Exception:
+        raise HTTPException(502, "Cannot reach TV — is it on and connected?")
     for cid in content_ids:
         (THUMB_DIR / f"{cid}.jpg").unlink(missing_ok=True)
     _invalidate_art_cache()
