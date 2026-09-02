@@ -327,7 +327,18 @@
     transform: rotate(0deg) scale(1.03);
     box-shadow: var(--shadow-pop) var(--color-charcoal);
   }
+  /* Dim unselected cards so selection reads by contrast, not just a border
+     color that can blend into similarly-colored artwork. */
+  .select-mode .art-card:not(.selected):not(.current) { opacity: 0.45; }
+
   .art-card.selected { box-shadow: 0 0 0 3px var(--accent); }
+  .art-card.selected::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: rgba(43, 79, 160, 0.3);
+    pointer-events: none;
+  }
   .art-card.current { box-shadow: 0 0 0 3px var(--success); }
 
   .art-card .thumb {
@@ -447,6 +458,7 @@
     justify-content: center;
     color: #fff;
     font-size: 14px;
+    z-index: 1;
   }
 
   .select-mode .art-card .checkbox { display: flex; }
@@ -3351,11 +3363,24 @@
         event.preventDefault();
         if (selectedIds.has(id)) selectedIds.delete(id);
         else selectedIds.add(id);
-        renderGrid();
+        updateCardSelectionUI(id);
         updateSelectionInfo();
         return;
       }
       openDetail(id);
+    }
+
+    // Toggle one card's selected styling in place, instead of the full
+    // renderGrid() rebuild — that was tearing down and recreating every
+    // card (images included) on each click, which read as the page
+    // "refreshing" while multi-selecting.
+    function updateCardSelectionUI(id) {
+      const card = document.querySelector(`.art-card[data-id="${id}"]`);
+      if (!card) return;
+      const isSelected = selectedIds.has(id);
+      card.classList.toggle('selected', isSelected);
+      const checkbox = card.querySelector('.checkbox');
+      if (checkbox) checkbox.innerHTML = isSelected ? '&#10003;' : '';
     }
 
     function toggleSelectMode() {
