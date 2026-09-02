@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import io
 import json
 import logging
@@ -42,6 +43,10 @@ TV_MAC = os.environ.get("DOCENT_TV_MAC", "")
 # sleep/wake), so a single attempt is unreliable — we wake + retry.
 TV_CONNECT_ATTEMPTS = int(os.environ.get("DOCENT_TV_ATTEMPTS", "3"))
 TV_RETRY_DELAY = float(os.environ.get("DOCENT_TV_RETRY_DELAY", "2"))
+# A completed TV op slower than this (ms) is logged at WARNING with a
+# wait/connect/call timing breakdown, even at default log level — a cheap way
+# to spot slow calls without having to run at DEBUG all the time.
+TV_SLOW_LOG_MS = float(os.environ.get("DOCENT_TV_SLOW_MS", "2000"))
 
 DATA_DIR = Path(os.environ.get("DOCENT_DATA_DIR", "") or Path(__file__).parent)
 TOKEN_FILE = DATA_DIR / ".tv-token"
@@ -79,12 +84,30 @@ _LOG_LEVEL_NAME = os.environ.get("DOCENT_LOG_LEVEL", "INFO").upper()
 _LOG_LEVEL = logging.getLevelName(_LOG_LEVEL_NAME)
 if not isinstance(_LOG_LEVEL, int):
     _LOG_LEVEL = logging.INFO
-logging.basicConfig(
-    level=_LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+
+_log_formatter = logging.Formatter(
+    "%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+
+# Optional on-disk logging (e.g. for analyzing TV call latency) — off by
+# default. A relative path is resolved under DATA_DIR so it lands in the
+# persisted volume rather than the (ephemeral) container filesystem.
+_LOG_FILE = os.environ.get("DOCENT_LOG_FILE", "").strip()
+if _LOG_FILE:
+    from logging.handlers import RotatingFileHandler
+    _log_path = Path(_LOG_FILE)
+    if not _log_path.is_absolute():
+        _log_path = DATA_DIR / _log_path
+    _log_path.parent.mkdir(parents=True, exist_ok=True)
+    _log_handlers.append(RotatingFileHandler(_log_path, maxBytes=10 * 1024 * 1024, backupCount=5))
+
+for _h in _log_handlers:
+    _h.setFormatter(_log_formatter)
+logging.basicConfig(level=_LOG_LEVEL, handlers=_log_handlers)
 log = logging.getLogger("docent")
+if _LOG_FILE:
+    log.info("Logging to disk: %s", _log_path)
 
 _art_cache: list[dict] | None = None
 _current_id_cache: str | None = None
@@ -124,13 +147,16 @@ def art_connection(tv: SamsungTVWS):
     return art
 
 
-def _ensure_tv_connection():
-    """Return the current art connection, creating one if needed.
+def _ensure_tv_connection() -> tuple:
+    """Return (art, reconnected) for the current connection, creating one if needed.
 
     Must only be called while ``_tv_lock`` is held.  If the connection
     has been idle longer than ``TV_CONN_MAX_IDLE`` seconds it is
     proactively closed and reopened — Samsung Frame WebSockets go
     stale after ~30-60 s of inactivity, leading to BrokenPipeError.
+
+    ``reconnected`` tells the caller whether this call paid the (re)connect
+    handshake cost, for latency instrumentation in ``_tv_op``.
     """
     global _tv_conn, _tv_art, _tv_last_used
     if _tv_art is not None:
@@ -139,14 +165,14 @@ def _ensure_tv_connection():
             log.debug("TV connection idle for %.0fs — reconnecting", idle)
             _close_tv_connection()
         else:
-            return _tv_art
+            return _tv_art, False
     tv = get_tv()
     art = art_connection(tv)
     _tv_conn = tv
     _tv_art = art
     _tv_last_used = time.monotonic()
     log.debug("TV connection opened")
-    return art
+    return art, True
 
 
 def _close_tv_connection():
@@ -208,21 +234,47 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
     Pass ``attempts=1`` for non-idempotent calls like uploads (so a lost
     response can't trigger a duplicate), with a larger ``timeout`` to allow
     the data transfer.
+
+    Each attempt is timed in three parts — time spent waiting for
+    ``_tv_lock`` (contention from other concurrent requests), time spent
+    (re)establishing the WebSocket (paid whenever the connection was idle
+    past ``TV_CONN_MAX_IDLE``), and the actual TV round-trip — logged at
+    DEBUG always, and promoted to WARNING past ``TV_SLOW_LOG_MS`` so slow
+    calls surface without needing DEBUG on.
     """
     if timeout is None:
         timeout = TV_TIMEOUT + 8
 
+    # Name of the endpoint/task that called us, for grouping slow calls by
+    # origin (e.g. "upload_art" vs "run_drive_sync") in the logs.
+    caller = inspect.currentframe().f_back.f_code.co_name
+
     def _job():
-        art = _ensure_tv_connection()
-        return fn(art)
+        t0 = time.monotonic()
+        art, reconnected = _ensure_tv_connection()
+        t1 = time.monotonic()
+        result = fn(art)
+        t2 = time.monotonic()
+        return result, reconnected, t1 - t0, t2 - t1
 
     last_exc: Exception | None = None
     for attempt in range(attempts):
+        wait_start = time.monotonic()
         async with _tv_lock:
+            wait_s = time.monotonic() - wait_start
             try:
-                result = await asyncio.wait_for(asyncio.to_thread(_job), timeout=timeout)
+                result, reconnected, connect_s, call_s = await asyncio.wait_for(
+                    asyncio.to_thread(_job), timeout=timeout
+                )
                 global _tv_last_used
                 _tv_last_used = time.monotonic()
+                total_ms = (wait_s + connect_s + call_s) * 1000
+                log_fn = log.warning if total_ms > TV_SLOW_LOG_MS else log.debug
+                log_fn(
+                    "TV op %s: wait=%.0fms connect=%.0fms call=%.0fms total=%.0fms%s",
+                    caller, wait_s * 1000, connect_s * 1000, call_s * 1000, total_ms,
+                    " [reconnected]" if reconnected else "",
+                )
                 return result
             except ResponseError:
                 raise  # TV answered with a definitive error — retrying won't help
@@ -1949,13 +2001,25 @@ def _extract_folder_id(url: str) -> str | None:
     return None
 
 
-async def _drive_list_files(folder_id: str, api_key: str) -> list[dict]:
+_DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+_DRIVE_MAX_RECURSION_DEPTH = 10
+
+
+async def _drive_list_files(folder_id: str, api_key: str, _depth: int = 0) -> list[dict]:
+    if _depth > _DRIVE_MAX_RECURSION_DEPTH:
+        return []
+
     files = []
+    subfolders = []
     page_token = None
     async with httpx.AsyncClient(timeout=30) as client:
         while True:
             params = {
-                "q": f"'{folder_id}' in parents and mimeType contains 'image/' and trashed=false",
+                "q": (
+                    f"'{folder_id}' in parents and "
+                    f"(mimeType contains 'image/' or mimeType = '{_DRIVE_FOLDER_MIME}') and "
+                    "trashed=false"
+                ),
                 "key": api_key,
                 "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,size)",
                 "pageSize": 100,
@@ -1967,10 +2031,18 @@ async def _drive_list_files(folder_id: str, api_key: str) -> list[dict]:
                 log.warning("Drive API error: %s — %s", resp.status_code, resp.text[:200])
                 raise HTTPException(502, "Google Drive API error — check your API key")
             data = resp.json()
-            files.extend(data.get("files", []))
+            for f in data.get("files", []):
+                if f.get("mimeType") == _DRIVE_FOLDER_MIME:
+                    subfolders.append(f)
+                else:
+                    files.append(f)
             page_token = data.get("nextPageToken")
             if not page_token:
                 break
+
+    for sub in subfolders:
+        files.extend(await _drive_list_files(sub["id"], api_key, _depth + 1))
+
     return files
 
 
@@ -2509,17 +2581,22 @@ def main():
     # server mid-upload and kill in-flight work. Developers can opt in with
     # DOCENT_RELOAD=1; even then we exclude the data files from the watcher.
     uvi_level = _LOG_LEVEL_NAME.lower()
+    # When file logging is on, skip uvicorn's own logging setup so its
+    # "uvicorn"/"uvicorn.access" loggers propagate to our root handlers
+    # (console + file) instead of writing only to the console themselves.
+    uvi_log_config = None if _LOG_FILE else uvicorn.config.LOGGING_CONFIG
     if os.environ.get("DOCENT_RELOAD") == "1":
         uvicorn.run(
             "server:app",
             host=host,
             port=port,
             log_level=uvi_level,
+            log_config=uvi_log_config,
             reload=True,
             reload_excludes=[".cache/*", "*.json", ".tv-token"],
         )
     else:
-        uvicorn.run("server:app", host=host, port=port, log_level=uvi_level)
+        uvicorn.run("server:app", host=host, port=port, log_level=uvi_level, log_config=uvi_log_config)
 
 
 if __name__ == "__main__":
