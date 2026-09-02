@@ -590,6 +590,14 @@ async def _prefetch_thumbnails(content_ids: list[str], *, source: str = "fallbac
                 for remaining in remaining_ids:
                     _thumb_prefetch_in_progress.discard(remaining)
                 break
+            if _get_cached_thumbnail(cid):
+                # Already cached by a concurrent fetch (e.g. the batch
+                # endpoint) — skip the redundant TV round-trip so a slow/dead
+                # TV call doesn't burn the lock and a timeout on work that's
+                # already done.
+                consecutive_failures = 0
+                _thumb_prefetch_in_progress.discard(cid)
+                continue
             try:
                 data = await _tv_op(
                     lambda art, _cid=cid: art.get_thumbnail(_cid),
