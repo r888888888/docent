@@ -120,6 +120,19 @@ _meta_lock = asyncio.Lock()
 _collections_lock = asyncio.Lock()
 _config_lock = asyncio.Lock()
 _usage_lock = asyncio.Lock()
+_slideshow_task: asyncio.Task | None = None
+_slideshow_state: dict = {
+    "running": False,
+    "collection_id": None,
+    "collection_name": None,
+    "current_id": None,
+    "index": 0,
+    "total": 0,
+    "interval": 0,
+    "shuffle": False,
+    "started": None,
+}
+_SLIDESHOW_MAX_FAILURES = 5  # consecutive select_image failures before auto-stop
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 _nws_station_cache: dict[str, str] = {}
 
@@ -1063,6 +1076,110 @@ async def set_slideshow(body: dict):
         raise HTTPException(502, "Cannot reach TV")
 
 
+# --- Collection slideshow ---
+#
+# The TV's native slideshow (above) only rotates through a fixed built-in
+# category (my-photos/favourites/store) — there's no way to scope it to an
+# arbitrary set of content_ids. This drives our own loop instead, calling
+# select_image on a timer to cycle through a Collection's items.
+
+async def _run_slideshow(collection_id: str, content_ids: list[str], interval: float, shuffle: bool) -> None:
+    """Cycle a Collection's photos on the TV until cancelled or the TV goes unreachable.
+
+    Mirrors the consecutive-failure/graceful-degrade pattern used by
+    ``_prefetch_thumbnails`` (server.py) rather than retrying forever.
+    """
+    global _slideshow_task, _current_id_cache
+    order = list(content_ids)
+    consecutive_failures = 0
+    try:
+        while True:
+            if shuffle:
+                random.shuffle(order)
+            for i, cid in enumerate(order):
+                try:
+                    await _tv_op(lambda art, _c=cid: art.select_image(_c, show=True))
+                    consecutive_failures = 0
+                    _current_id_cache = cid
+                    _slideshow_state["current_id"] = cid
+                    _slideshow_state["index"] = i
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    consecutive_failures += 1
+                    log.warning(
+                        "Slideshow select_image failed for %s (%d consecutive): %s",
+                        cid, consecutive_failures, e,
+                    )
+                    if consecutive_failures >= _SLIDESHOW_MAX_FAILURES:
+                        log.warning(
+                            "Slideshow stopping after %d consecutive failures — TV likely unreachable",
+                            consecutive_failures,
+                        )
+                        return
+                await asyncio.sleep(interval)
+    finally:
+        _slideshow_state["running"] = False
+        _slideshow_task = None
+
+
+async def _stop_slideshow_task() -> None:
+    """Cancel the running slideshow task, if any, and wait for cleanup to finish."""
+    global _slideshow_task
+    if _slideshow_task is not None and not _slideshow_task.done():
+        _slideshow_task.cancel()
+        try:
+            await _slideshow_task
+        except asyncio.CancelledError:
+            pass
+
+
+@app.post("/api/collections/{collection_id}/play")
+async def play_collection(collection_id: str, body: dict):
+    global _slideshow_task
+    interval = body.get("interval", 300)
+    shuffle = bool(body.get("shuffle", False))
+    if not isinstance(interval, (int, float)) or interval < 5:
+        raise HTTPException(400, "interval must be a number >= 5 (seconds)")
+
+    data = _load_collections()
+    collection = next((c for c in data["collections"] if c["id"] == collection_id), None)
+    if collection is None:
+        raise HTTPException(404, "Collection not found")
+    content_ids = list(collection["content_ids"])
+    if not content_ids:
+        raise HTTPException(400, "Collection is empty")
+
+    await _stop_slideshow_task()  # replace any slideshow already running
+
+    _slideshow_state.update({
+        "running": True,
+        "collection_id": collection_id,
+        "collection_name": collection["name"],
+        "current_id": None,
+        "index": 0,
+        "total": len(content_ids),
+        "interval": interval,
+        "shuffle": shuffle,
+        "started": datetime.now(timezone.utc).isoformat(),
+    })
+    _slideshow_task = asyncio.create_task(
+        _run_slideshow(collection_id, content_ids, interval, shuffle)
+    )
+    return {"ok": True, **_slideshow_state}
+
+
+@app.post("/api/slideshow-stop")
+async def stop_slideshow():
+    await _stop_slideshow_task()
+    return {"ok": True}
+
+
+@app.get("/api/slideshow-status")
+async def slideshow_status():
+    return dict(_slideshow_state)
+
+
 # --- Collections ---
 
 def _load_collections() -> dict:
@@ -1134,6 +1251,8 @@ async def rename_collection(collection_id: str, body: dict):
 
 @app.delete("/api/collections/{collection_id}")
 async def delete_collection(collection_id: str):
+    if _slideshow_state.get("collection_id") == collection_id:
+        await _stop_slideshow_task()
     async with _collections_lock:
         data = _load_collections()
         before = len(data["collections"])

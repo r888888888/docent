@@ -2136,6 +2136,7 @@
         <option value="">All Artwork</option>
       </select>
       <button class="btn-icon" onclick="createCollection()" title="New collection">+</button>
+      <button class="btn-icon" id="btnSlideshowToggle" onclick="toggleSlideshow()" title="Select a collection to play as slideshow" disabled>&#9654;</button>
     </div>
     <button id="btnSelectMode" onclick="toggleSelectMode()" title="Toggle artwork selection mode">Select</button>
     <span class="selection-info" id="selectionInfo"></span>
@@ -2444,6 +2445,7 @@
     let uploadStage = 'review';  // 'review' | 'crop' | 'upload' — drives #uploadStepBar
     let collections = [];
     let activeCollectionId = null;
+    let slideshowStatus = { running: false, collection_id: null };
     const thumbCache = {};
     const _colorCache = {};
 
@@ -2803,6 +2805,8 @@
       loadArt();
       loadMattes();
       loadCollections();
+      pollSlideshowStatus();
+      setInterval(pollSlideshowStatus, 5000);
 
       const savedZoom = localStorage.getItem('thumbZoom');
       if (savedZoom) setZoom(parseInt(savedZoom));
@@ -3711,6 +3715,55 @@
     function filterByCollection(id) {
       activeCollectionId = id || null;
       renderGrid();
+      updateSlideshowButton();
+    }
+
+    function updateSlideshowButton() {
+      const btn = document.getElementById('btnSlideshowToggle');
+      const selectedId = document.getElementById('collectionFilter').value;
+      if (!selectedId) {
+        btn.disabled = true;
+        btn.innerHTML = '&#9654;';
+        btn.title = 'Select a collection to play as slideshow';
+        return;
+      }
+      btn.disabled = false;
+      const isThisPlaying = slideshowStatus.running && slideshowStatus.collection_id === selectedId;
+      btn.innerHTML = isThisPlaying ? '&#9632;' : '&#9654;';
+      btn.title = isThisPlaying ? 'Stop slideshow' : 'Play this collection as a slideshow';
+    }
+
+    async function toggleSlideshow() {
+      const selectedId = document.getElementById('collectionFilter').value;
+      if (!selectedId) return;
+      const isThisPlaying = slideshowStatus.running && slideshowStatus.collection_id === selectedId;
+      try {
+        if (isThisPlaying) {
+          await api('/slideshow-stop', { method: 'POST' });
+          toast('Slideshow stopped', 'success');
+        } else {
+          await api(`/collections/${selectedId}/play`, { method: 'POST', body: {} });
+          toast('Slideshow started', 'success');
+        }
+        await pollSlideshowStatus();
+      } catch (e) {
+        toast('Failed: ' + e.message, 'error');
+      }
+    }
+
+    async function pollSlideshowStatus() {
+      try {
+        const data = await api('/slideshow-status');
+        slideshowStatus = data;
+        if (data.running && data.current_id && data.current_id !== currentId) {
+          currentId = data.current_id;
+          renderGrid();
+          _updateCurrentCardObserver();
+        }
+        updateSlideshowButton();
+      } catch (e) {
+        console.debug('slideshow status poll failed:', e);
+      }
     }
 
     async function createCollection() {
