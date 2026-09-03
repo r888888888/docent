@@ -37,12 +37,15 @@ TV_TIMEOUT = int(os.environ.get("DOCENT_TV_TIMEOUT", "10"))
 # Wake-on-LAN target (the TV's MAC). When set, Docent wakes a sleeping Frame
 # before retrying a failed connection. Find it with: arp -n <tv-ip>
 TV_MAC = os.environ.get("DOCENT_TV_MAC", "")
-# How many times to (re)try establishing a TV conversation, and how long to
-# wait between tries. The Frame frequently accepts the TCP connection without
-# answering the art-mode handshake (busy with its on-screen UI, or mid
-# sleep/wake), so a single attempt is unreliable — we wake + retry.
+# How many times to (re)try establishing a TV conversation, and the base
+# delay between tries. The Frame frequently accepts the TCP connection
+# without answering the art-mode handshake (busy with its on-screen UI, or
+# mid sleep/wake), so a single attempt is unreliable — we wake + retry. The
+# delay grows linearly (TV_RETRY_DELAY * attempt) since waking from sleep can
+# take several seconds — a flat short delay tends to burn attempts before the
+# TV has actually come back up.
 TV_CONNECT_ATTEMPTS = int(os.environ.get("DOCENT_TV_ATTEMPTS", "3"))
-TV_RETRY_DELAY = float(os.environ.get("DOCENT_TV_RETRY_DELAY", "2"))
+TV_RETRY_DELAY = float(os.environ.get("DOCENT_TV_RETRY_DELAY", "3"))
 # A completed TV op slower than this (ms) is logged at WARNING with a
 # wait/connect/call timing breakdown, even at default log level — a cheap way
 # to spot slow calls without having to run at DEBUG all the time.
@@ -240,7 +243,11 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
     hung connection can never hold the lock forever — it raises and releases.
     On failure the connection is closed (so the next attempt opens a fresh
     one), a Wake-on-LAN packet is sent, and the lock is **released** during
-    the retry delay so other operations aren't starved.
+    the retry delay so other operations aren't starved. The delay grows
+    linearly (``TV_RETRY_DELAY * attempt``) since a real Frame TV can take
+    several seconds to bring its art-mode service back up after a WoL
+    packet — a flat short delay tends to burn attempts before the TV has
+    actually woken up.
 
     A definitive ``ResponseError`` from the TV (e.g. the matte "-10"
     rejection) is not retried.
@@ -297,12 +304,13 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
                 _close_tv_connection()
         # Lock released — other operations can proceed during retry delay
         if attempt + 1 < attempts:
+            delay = TV_RETRY_DELAY * (attempt + 1)
             log.info(
-                "TV op attempt %d/%d failed (%s) — waking TV and retrying",
-                attempt + 1, attempts, type(last_exc).__name__,
+                "TV op attempt %d/%d failed (%s) — waking TV and retrying in %.0fs",
+                attempt + 1, attempts, type(last_exc).__name__, delay,
             )
             _wake_tv()
-            await asyncio.sleep(TV_RETRY_DELAY)
+            await asyncio.sleep(delay)
     assert last_exc is not None
     raise last_exc
 
