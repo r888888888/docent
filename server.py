@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.staticfiles import StaticFiles
 from PIL import Image
 from samsungtvws import SamsungTVWS
@@ -434,13 +435,36 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# GZipMiddleware compresses any response over its size threshold regardless
+# of content-type — fine for index.html/JSON API responses (4-8x smaller),
+# wasted CPU for thumbnails and static assets (already-compressed JPEGs
+# gain ~nothing). This ASGI-level wrapper skips those paths entirely so
+# gzip only runs where it actually pays off; a decorator-style
+# ``@app.middleware("http")`` can't do this since it can't delegate to
+# another ASGI app's raw send/receive stream.
+_GZIP_SKIP_PREFIXES = ("/api/thumbnail", "/assets")
+
+
+class SelectiveGZipMiddleware:
+    def __init__(self, app, minimum_size: int = 500):
+        self.gzip_app = GZipMiddleware(app, minimum_size=minimum_size)
+        self.plain_app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "").startswith(_GZIP_SKIP_PREFIXES):
+            await self.plain_app(scope, receive, send)
+        else:
+            await self.gzip_app(scope, receive, send)
+
+
 app = FastAPI(title="Docent", lifespan=lifespan)
 app.mount("/assets", StaticFiles(directory=Path(__file__).parent / "assets"), name="assets")
+app.add_middleware(SelectiveGZipMiddleware, minimum_size=500)
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    if request.url.path.startswith("/assets"):
+    if request.url.path.startswith("/assets") or request.url.path.startswith("/api/thumbnail"):
         return await call_next(request)
     start = time.time()
     response = await call_next(request)
@@ -495,22 +519,41 @@ async def health():
 
 # --- TV info ---
 
+# `supported` and `api_version` are fixed properties of the TV model/firmware
+# — they never change for the life of the process, but the naive
+# implementation queried them on every single /api/info call (2 of its 3 TV
+# round-trips). Cache them after the first successful fetch so repeat calls
+# (the frontend polls this at startup) only need the one call that actually
+# changes: get_artmode().
+_tv_static_info_cache: dict | None = None
+
+
 @app.get("/api/info")
 async def tv_info():
+    global _tv_static_info_cache
+
     def _info(art):
-        supported = art.supported()
+        if _tv_static_info_cache is not None:
+            supported = _tv_static_info_cache["supported"]
+            api_version = _tv_static_info_cache["api_version"]
+        else:
+            supported = art.supported()
+            api_version = art.get_api_version() if supported else None
         return {
             "supported": supported,
-            "api_version": art.get_api_version() if supported else None,
+            "api_version": api_version,
             "artmode": art.get_artmode() if supported else None,
             "ip": TV_IP,
         }
 
     try:
-        return await _tv_op(_info)
+        result = await _tv_op(_info)
     except Exception as e:
         log.warning("TV connection failed: %s", e)
         raise HTTPException(502, "Cannot reach TV — is it on and connected?")
+    if _tv_static_info_cache is None:
+        _tv_static_info_cache = {"supported": result["supported"], "api_version": result["api_version"]}
+    return result
 
 
 @app.get("/api/device-info")
@@ -554,14 +597,34 @@ _THUMB_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 @app.get("/api/thumbnail/{content_id}")
 async def get_thumbnail(content_id: str):
     _validate_content_id(content_id)
-    cached = _get_cached_thumbnail(content_id)
-    if cached:
-        return Response(content=cached, media_type="image/jpeg", headers=_THUMB_CACHE_HEADERS)
+    path = THUMB_DIR / f"{content_id}.jpg"
+    if path.exists():
+        # FileResponse streams via sendfile and lets Starlette add
+        # ETag/Last-Modified, so a 304 short-circuits repeat requests
+        # entirely instead of re-reading and re-sending the file — the
+        # common case now that the frontend links directly to this URL
+        # for every already-cached card instead of round-tripping
+        # through the base64 batch endpoint.
+        return FileResponse(path, media_type="image/jpeg", headers=_THUMB_CACHE_HEADERS)
     data = await _tv_op(lambda art: art.get_thumbnail(content_id))
     if not data:
         raise HTTPException(404, "No thumbnail")
     _save_thumbnail(content_id, data)
     return Response(content=bytes(data), media_type="image/jpeg", headers=_THUMB_CACHE_HEADERS)
+
+
+@app.get("/api/thumbnails/cached")
+async def get_cached_thumbnail_ids():
+    """Which content_ids already have a thumbnail on disk.
+
+    Cheap (a single directory listing, no file reads) — used by the
+    frontend at load time to render already-cached thumbnails as plain
+    ``<img src="/api/thumbnail/{id}">`` tags (real HTTP requests the
+    browser can cache) instead of routing them through the base64/JSON
+    batch endpoint below, which exists for the (usually small) set of
+    ids not yet cached.
+    """
+    return {"cached": await asyncio.to_thread(lambda: list(_cached_content_ids()))}
 
 
 # Background thumbnail prefetch — tracks IDs already being fetched so
@@ -716,14 +779,8 @@ async def _startup_prefetch() -> None:
     await _prefetch_thumbnails(uncached, source="startup")
 
 
-@app.post("/api/thumbnails")
-async def get_thumbnails_batch(body: dict):
-    global _thumb_prefetch_running
-    content_ids = body.get("content_ids", [])
-    if not content_ids:
-        return {"thumbnails": {}, "missing": [], "fallback": False}
-    _validate_content_ids(content_ids)
-
+def _collect_cached_thumbnails(content_ids: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Read + base64-encode whatever's already cached (blocking disk I/O)."""
     encoded = {}
     missing = []
     for cid in content_ids:
@@ -732,6 +789,21 @@ async def get_thumbnails_batch(body: dict):
             encoded[cid] = base64.b64encode(cached).decode()
         else:
             missing.append(cid)
+    return encoded, missing
+
+
+@app.post("/api/thumbnails")
+async def get_thumbnails_batch(body: dict):
+    global _thumb_prefetch_running
+    content_ids = body.get("content_ids", [])
+    if not content_ids:
+        return {"thumbnails": {}, "missing": [], "fallback": False}
+    _validate_content_ids(content_ids)
+
+    # Reading + base64-encoding up to BATCH (20) thumbnails is blocking
+    # disk I/O — run it off the event loop so it can't stall other
+    # requests (including other TV ops waiting on _tv_lock).
+    encoded, missing = await asyncio.to_thread(_collect_cached_thumbnails, content_ids)
 
     fallback = False
     if missing:
@@ -1228,7 +1300,7 @@ def _save_collections(data: dict) -> None:
 
 @app.get("/api/collections")
 async def list_collections():
-    return _load_collections()
+    return await asyncio.to_thread(_load_collections)
 
 
 @app.post("/api/collections")
@@ -1322,7 +1394,10 @@ def _save_artwork_meta(data: dict) -> None:
 
 @app.get("/api/artwork-meta")
 async def get_artwork_meta():
-    return _load_artwork_meta()
+    # This file is read on every page load (in parallel with /api/art and
+    # /api/collections now — see the frontend init() change) and grows with
+    # the catalog, so keep the read off the event loop.
+    return await asyncio.to_thread(_load_artwork_meta)
 
 
 @app.put("/api/artwork-meta/{content_id}")
