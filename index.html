@@ -2558,6 +2558,13 @@
     let slideshowStatus = { running: false, collection_id: null };
     const thumbCache = {};
     const _colorCache = {};
+    // content_ids already cached on disk server-side (from GET
+    // /api/thumbnails/cached). Cards for these ids render a plain
+    // <img src="/api/thumbnail/{id}"> directly — a real, cacheable HTTP
+    // request — instead of going through the base64/JSON batch endpoint
+    // and IntersectionObserver machinery below, which exists for the
+    // (usually small) set of ids not yet cached.
+    let diskCachedThumbIds = new Set();
 
     // Dynamic favicon recoloring
     const _faviconState = { img: null, links: [], originals: [] };
@@ -2901,15 +2908,19 @@
     // --- Init ---
 
     async function init() {
-      try {
-        const info = await api('/info');
+      // /api/info makes up to 3 TV round-trips and can block for 10-30s if
+      // the TV is asleep (growing retry delays). Everything else below is
+      // served from local cache and doesn't touch the TV at all, so let
+      // /info resolve in the background instead of gating the whole page
+      // load behind it.
+      api('/info').then(info => {
         artModeOn = info.artmode === 'on';
         updateArtModeButton();
         updateTvStatus(true);
-      } catch (e) {
+      }).catch(e => {
         updateTvStatus(false);
         toast('Cannot connect to TV: ' + e.message, 'error');
-      }
+      });
 
       await loadArtworkMeta();
       loadArt();
@@ -2955,7 +2966,10 @@
         if (!card) return;
         const cardId = card.dataset.id;
         _lastHoveredCardId = cardId;
-        const src = thumbCache[cardId];
+        // Most cards now render straight to <img src="/api/thumbnail/...">
+        // (see renderCardHtml) rather than populating thumbCache, so fall
+        // back to whatever image element is actually on screen.
+        const src = thumbCache[cardId] || document.getElementById('thumb-' + cardId)?.src;
         if (!src) return;
         const color = await extractDominantColor(src);
         if (_lastHoveredCardId !== cardId) return;
@@ -3052,12 +3066,24 @@
 
     // --- Art loading (cached) ---
 
+    async function loadCachedThumbIds() {
+      try {
+        const data = await api('/thumbnails/cached');
+        diskCachedThumbIds = new Set(data.cached || []);
+      } catch (err) {
+        console.debug('loadCachedThumbIds failed:', err);
+      }
+    }
+
     async function loadArt() {
       const grid = document.getElementById('artGrid');
       grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text2)"><div class="spinner"></div><br>Loading artwork...</div>';
 
       try {
-        const data = await api('/art');
+        // Fetched together — knowing which ids are already cached before
+        // the first render means most cards render as plain, cacheable
+        // <img> tags immediately instead of a "Loading..." placeholder.
+        const [data] = await Promise.all([api('/art'), loadCachedThumbIds()]);
         artItems = data.items || [];
         currentId = data.current_id;
         if (data.stale) toast('Showing cached data — TV unreachable', 'info');
@@ -3072,7 +3098,10 @@
     async function refreshArt() {
       const grid = document.getElementById('artGrid');
       try {
-        const data = await api('/art/refresh', { method: 'POST' });
+        const [data] = await Promise.all([
+          api('/art/refresh', { method: 'POST' }),
+          loadCachedThumbIds(),
+        ]);
         artItems = data.items || [];
         currentId = data.current_id;
         const newCount = data.new_ids?.length || 0;
@@ -3096,6 +3125,12 @@
       const isSelected = selectedIds.has(id);
       const title = getArtworkTitle(item);
       const cached = thumbCache[id];
+      // A plain, cacheable image request for anything already on disk
+      // server-side (the common case once startup prefetch has warmed
+      // up) — the IntersectionObserver/batch-endpoint path further below
+      // only ever runs for ids that are neither in-memory nor on-disk
+      // cached yet.
+      const thumbSrc = cached || (diskCachedThumbIds.has(id) ? `/api/thumbnail/${encodeURIComponent(id)}` : null);
       const meta = artworkMeta[id];
       const tilt = ((parseInt(id.substring(0, 8), 16) % 200) - 100) / 100;
       let aspectBadge = '';
@@ -3115,8 +3150,8 @@
           ${isCurrent ? '<span class="current-badge">Displayed</span>' : ''}
           ${aspectBadge}
           ${failBadge}
-          ${cached
-            ? `<img class="thumb" id="thumb-${id}" src="${cached}" alt="${title.replace(/"/g, '&quot;')}">`
+          ${thumbSrc
+            ? `<img class="thumb" id="thumb-${id}" src="${thumbSrc}" alt="${title.replace(/"/g, '&quot;')}" loading="lazy" decoding="async" onerror="showThumbError('${id}')">`
             : `<div class="thumb loading" id="thumb-${id}">Loading...</div>`}
           <div class="title-overlay"><span>${title}</span></div>
         </div>`;
