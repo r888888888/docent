@@ -2199,6 +2199,14 @@
             </select>
           </div>
         </div>
+        <div class="upload-matte-group">
+          <label>Add to Collection</label>
+          <div class="upload-matte-row">
+            <select id="uploadCollection" aria-label="Add uploaded artwork to a collection">
+              <option value="">None</option>
+            </select>
+          </div>
+        </div>
         <div class="upload-footer-actions">
           <p id="uploadStatus" class="upload-status-text"></p>
           <button class="primary" id="uploadSubmitBtn" onclick="doUpload()" title="Upload selected artwork to your Frame TV">Upload to Frame</button>
@@ -3869,6 +3877,12 @@
       sel.innerHTML = '<option value="">All Artwork</option>' +
         collections.map(c => `<option value="${esc(c.id)}">${esc(c.name)} (${c.content_ids.length})</option>`).join('');
       if (prev && collections.find(c => c.id === prev)) sel.value = prev;
+
+      const uploadSel = document.getElementById('uploadCollection');
+      const uploadPrev = uploadSel.value;
+      uploadSel.innerHTML = '<option value="">None</option>' +
+        collections.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+      if (uploadPrev && collections.find(c => c.id === uploadPrev)) uploadSel.value = uploadPrev;
     }
 
     function filterByCollection(id) {
@@ -4820,6 +4834,8 @@
       if (!pendingFiles.length) { cancelUpload(); return; }
       setUploadStage('upload');
       const matte = document.getElementById('uploadMatte').value;
+      const targetCollectionId = document.getElementById('uploadCollection').value;
+      const uploadedContentIds = [];
 
       document.getElementById('uploadThumbStrip').style.display = 'none';
       document.getElementById('uploadControls').style.display = 'none';
@@ -4885,6 +4901,7 @@
             artworkMeta[result.content_id] = {
               title: result.title, width: result.width, height: result.height,
             };
+            if (targetCollectionId) uploadedContentIds.push(result.content_id);
 
             // Stage 2: a real, separately-timed analysis call — not folded
             // into the upload request, so this stage only shows once it's
@@ -4908,6 +4925,18 @@
           }
         } catch (e) {
           toast(`Failed to upload ${file.name}: ${e.message}`, 'error');
+        }
+      }
+
+      if (targetCollectionId && uploadedContentIds.length) {
+        try {
+          await api(`/collections/${targetCollectionId}/items`, {
+            method: 'POST',
+            body: { content_ids: uploadedContentIds },
+          });
+          await loadCollections();
+        } catch (err) {
+          toast('Uploaded, but failed to add to collection', 'error');
         }
       }
 
