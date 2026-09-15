@@ -13,6 +13,7 @@ import socket
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -116,6 +117,14 @@ if _LOG_FILE:
 _art_cache: list[dict] | None = None
 _current_id_cache: str | None = None
 _tv_lock = asyncio.Lock()
+# TV calls run here instead of the default asyncio.to_thread pool. If a TV
+# socket call ever stalls past what asyncio.wait_for gives up on (its await
+# is abandoned, but the worker thread it was running in keeps running), that
+# thread is gone for good — on the default pool that would eventually starve
+# every other to_thread call in the app (collections/meta file I/O included)
+# behind a TV that's merely slow or unreachable. Keeping TV calls in their
+# own small pool contains the damage to TV-dependent endpoints only.
+_TV_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tv-op")
 _tv_conn: SamsungTVWS | None = None
 _tv_art = None
 _tv_last_used: float = 0
@@ -286,7 +295,8 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
             wait_s = time.monotonic() - wait_start
             try:
                 result, reconnected, connect_s, call_s = await asyncio.wait_for(
-                    asyncio.to_thread(_job), timeout=timeout
+                    asyncio.get_running_loop().run_in_executor(_TV_EXECUTOR, _job),
+                    timeout=timeout,
                 )
                 global _tv_last_used
                 _tv_last_used = time.monotonic()
