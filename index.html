@@ -2528,7 +2528,7 @@
       </div>
 
       <div class="settings-actions">
-        <button class="primary" onclick="saveAiSettings()" title="Save AI configuration">Save</button>
+        <button class="primary" id="settingsSaveBtn" onclick="saveAiSettings()" title="Save AI configuration">Save</button>
         <button onclick="analyzeAllUnanalyzed()" title="Run AI analysis on all unanalyzed artwork">Analyze Unanalyzed</button>
         <button onclick="reanalyzeAll()" title="Re-run AI analysis on all artwork">Re-analyze All</button>
         <button onclick="closeSettings()" title="Close settings">Close</button>
@@ -4975,25 +4975,43 @@
     }
 
     async function openSettings() {
-      try {
-        const config = await api('/ai/config');
+      // Show the modal immediately with whatever is already known client-side;
+      // each section below fills in independently as its own API call resolves,
+      // instead of making the whole dialog wait on the slowest one (device-info
+      // talks to the physical TV and can lag).
+      document.getElementById('gvApiKey').value = '';
+      document.getElementById('aiApiKey').value = '';
+      document.getElementById('openaiApiKey').value = '';
+      document.getElementById('batchProgress').textContent = '';
+      document.getElementById('reanalyzeWarning').style.display = 'none';
+
+      const saveBtn = document.getElementById('settingsSaveBtn');
+      saveBtn.disabled = true;
+
+      const usageSection = document.getElementById('usageSection');
+      const storageSection = document.getElementById('storageSection');
+      document.getElementById('usageDisplay').innerHTML = '<span class="spinner"></span>';
+      document.getElementById('storageDisplay').innerHTML = '<span class="spinner"></span>';
+      usageSection.style.display = '';
+      storageSection.style.display = '';
+
+      document.getElementById('settingsModal').classList.add('active');
+
+      const configPromise = api('/ai/config').then(config => {
         document.getElementById('useGoogleVision').checked = config.use_google_vision ?? true;
-        document.getElementById('gvApiKey').value = '';
         document.getElementById('gvApiKey').placeholder = config.google_vision?.api_key || 'AIza...';
         document.getElementById('aiProvider').value = config.provider || 'claude';
-        document.getElementById('aiApiKey').value = '';
         document.getElementById('aiApiKey').placeholder = config.claude?.api_key || 'sk-ant-...';
         document.getElementById('aiModel').value = config.claude?.model || 'claude-sonnet-5';
         document.getElementById('aiAutoAnalyze').checked = config.auto_analyze || false;
         document.getElementById('aiOpusFallback').checked = config.opus_fallback || false;
-        document.getElementById('openaiApiKey').value = '';
         document.getElementById('openaiApiKey').placeholder = config.openai?.api_key || 'sk-proj-...';
         document.getElementById('openaiModel').value = config.openai?.model || 'gpt-4.1';
         toggleProviderFields();
-      } catch (err) { console.debug('Settings config load failed:', err); }
-      try {
-        const usage = await api('/ai/usage');
-        const section = document.getElementById('usageSection');
+      }).catch(err => console.debug('Settings config load failed:', err))
+        .finally(() => { saveBtn.disabled = false; });
+
+      const usagePromise = api('/ai/usage').then(usage => {
         if (usage.calls > 0) {
           const tokens = (usage.input_tokens + usage.output_tokens).toLocaleString();
           const cost = usage.estimated_cost_usd;
@@ -5002,32 +5020,30 @@
           document.getElementById('usageDisplay').innerHTML =
             `${usage.calls} API call${usage.calls !== 1 ? 's' : ''} &middot; ${tokens} tokens<br>` +
             `Estimated cost: <strong>$${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}</strong>`;
-          section.style.display = '';
+          usageSection.style.display = '';
         } else {
-          section.style.display = 'none';
+          usageSection.style.display = 'none';
         }
-      } catch (err) { console.debug('Usage load failed:', err); document.getElementById('usageSection').style.display = 'none'; }
-      document.getElementById('batchProgress').textContent = '';
-      const warn = document.getElementById('reanalyzeWarning');
-      warn.style.display = 'none';
-      // TV storage info
-      try {
-        const devInfo = await api('/device-info');
+      }).catch(err => { console.debug('Usage load failed:', err); usageSection.style.display = 'none'; });
+
+      const storagePromise = api('/device-info').then(devInfo => {
         const info = devInfo.device_info;
         const flashGB = parseInt(info.tv_flash_size, 10);
         const itemCount = artItems.length;
-        const storageEl = document.getElementById('storageDisplay');
-        storageEl.innerHTML = `${flashGB} GB internal storage &middot; ${itemCount} artwork${itemCount !== 1 ? 's' : ''} on device`;
-        document.getElementById('storageSection').style.display = '';
-      } catch (err) { console.debug('Storage info load failed:', err); document.getElementById('storageSection').style.display = 'none'; }
-      if (artItems.length > 0) {
-        try {
-          const est = await api(`/ai/estimate?count=${artItems.length}`);
-          warn.style.display = 'block';
-          warn.textContent = `Re-analyzing all ${est.count} images will take ~${est.estimated_minutes} min and cost ~$${est.estimated_cost_usd.toFixed(2)} (${est.model})`;
-        } catch (err) { console.debug('AI estimate failed:', err); }
-      }
-      document.getElementById('settingsModal').classList.add('active');
+        document.getElementById('storageDisplay').innerHTML =
+          `${flashGB} GB internal storage &middot; ${itemCount} artwork${itemCount !== 1 ? 's' : ''} on device`;
+        storageSection.style.display = '';
+      }).catch(err => { console.debug('Storage info load failed:', err); storageSection.style.display = 'none'; });
+
+      const warn = document.getElementById('reanalyzeWarning');
+      const estimatePromise = artItems.length > 0
+        ? api(`/ai/estimate?count=${artItems.length}`).then(est => {
+            warn.style.display = 'block';
+            warn.textContent = `Re-analyzing all ${est.count} images will take ~${est.estimated_minutes} min and cost ~$${est.estimated_cost_usd.toFixed(2)} (${est.model})`;
+          }).catch(err => console.debug('AI estimate failed:', err))
+        : Promise.resolve();
+
+      await Promise.all([configPromise, usagePromise, storagePromise, estimatePromise]);
     }
 
     function closeSettings() {
