@@ -2607,8 +2607,14 @@
       });
     }
 
-    function extractDominantColor(imgSrc) {
-      if (_colorCache[imgSrc]) return Promise.resolve(_colorCache[imgSrc]);
+    function extractDominantColor(imgSrc, cacheKey) {
+      // Cache by the caller's stable key (e.g. content_id), not imgSrc
+      // itself — imgSrc can be a base64 data: URL tens of KB long for
+      // thumbnails still going through the batch-fetch fallback path,
+      // which is an expensive object key to hash and retains a second
+      // copy of the string for the life of the page.
+      cacheKey = cacheKey || imgSrc;
+      if (_colorCache[cacheKey]) return Promise.resolve(_colorCache[cacheKey]);
       return new Promise(resolve => {
         const img = new Image();
         img.onload = () => {
@@ -2635,7 +2641,7 @@
           const gray = (avg[0] + avg[1] + avg[2]) / 3;
           avg = avg.map(v => Math.min(255, Math.round(gray + (v - gray) * 1.5)));
           const hex = '#' + avg.map(v => v.toString(16).padStart(2, '0')).join('');
-          _colorCache[imgSrc] = hex;
+          _colorCache[cacheKey] = hex;
           resolve(hex);
         };
         img.onerror = () => resolve('#3A3632');
@@ -2867,17 +2873,26 @@
         }
       };
 
-      const getSortVal = (item) => {
+      // Precompute each item's group key and sort value once (a
+      // Schwartzian transform) rather than recomputing them — artworkMeta
+      // lookups, getArtworkTitle(), a regex test — inside the comparator,
+      // which Array.sort() calls O(n log n) times for O(n) items.
+      const decorated = items.map(item => {
+        const groupKey = getGroupKey(item);
+        let sortVal;
         if (currentSort === 'year') {
           const y = parseYearForSort(artworkMeta[item.content_id]?.ai_meta?.year);
-          return y === Infinity ? getGroupKey(item) : y;
+          sortVal = y === Infinity ? groupKey : y;
+        } else if (currentSort === 'date_added') {
+          sortVal = artworkMeta[item.content_id]?.uploaded_at || MISSING_PREFIX;
+        } else {
+          sortVal = groupKey.toLowerCase();
         }
-        if (currentSort === 'date_added') return artworkMeta[item.content_id]?.uploaded_at || MISSING_PREFIX;
-        return getGroupKey(item).toLowerCase();
-      };
+        return { item, groupKey, sortVal };
+      });
 
-      const sorted = [...items].sort((a, b) => {
-        const va = getSortVal(a), vb = getSortVal(b);
+      decorated.sort((a, b) => {
+        const va = a.sortVal, vb = b.sortVal;
         const aMissing = String(va).startsWith(MISSING_PREFIX);
         const bMissing = String(vb).startsWith(MISSING_PREFIX);
         if (aMissing && !bMissing) return 1;
@@ -2889,8 +2904,7 @@
       const result = [];
       let lastKey = null;
       let headerIdx = -1;
-      for (const item of sorted) {
-        const key = getGroupKey(item);
+      for (const { item, groupKey: key } of decorated) {
         if (key !== lastKey) {
           const label = key.startsWith(MISSING_PREFIX)
             ? key.slice(MISSING_PREFIX.length)
@@ -2971,7 +2985,7 @@
         // back to whatever image element is actually on screen.
         const src = thumbCache[cardId] || document.getElementById('thumb-' + cardId)?.src;
         if (!src) return;
-        const color = await extractDominantColor(src);
+        const color = await extractDominantColor(src, cardId);
         if (_lastHoveredCardId !== cardId) return;
         const r = parseInt(color.slice(1,3),16), g = parseInt(color.slice(3,5),16), b = parseInt(color.slice(5,7),16);
         document.getElementById('logoMark').style.backgroundColor = color;
