@@ -7,13 +7,15 @@ import io
 import json
 import logging
 import os
+import queue
 import random
 import re
 import socket
 import tempfile
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +54,11 @@ TV_RETRY_DELAY = float(os.environ.get("DOCENT_TV_RETRY_DELAY", "3"))
 # wait/connect/call timing breakdown, even at default log level — a cheap way
 # to spot slow calls without having to run at DEBUG all the time.
 TV_SLOW_LOG_MS = float(os.environ.get("DOCENT_TV_SLOW_MS", "2000"))
+# How long to give the TV worker to unwind after its socket is shut down
+# before writing the thread off as unrecoverable. A read that's been
+# interrupted raises almost immediately, so this only ever elapses when the
+# thread is parked somewhere the interrupt can't reach.
+TV_RECOVER_GRACE = 2.0
 
 DATA_DIR = Path(os.environ.get("DOCENT_DATA_DIR", "") or Path(__file__).parent)
 TOKEN_FILE = DATA_DIR / ".tv-token"
@@ -117,14 +124,6 @@ if _LOG_FILE:
 _art_cache: list[dict] | None = None
 _current_id_cache: str | None = None
 _tv_lock = asyncio.Lock()
-# TV calls run here instead of the default asyncio.to_thread pool. If a TV
-# socket call ever stalls past what asyncio.wait_for gives up on (its await
-# is abandoned, but the worker thread it was running in keeps running), that
-# thread is gone for good — on the default pool that would eventually starve
-# every other to_thread call in the app (collections/meta file I/O included)
-# behind a TV that's merely slow or unreachable. Keeping TV calls in their
-# own small pool contains the damage to TV-dependent endpoints only.
-_TV_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tv-op")
 _tv_conn: SamsungTVWS | None = None
 _tv_art = None
 _tv_last_used: float = 0
@@ -177,8 +176,8 @@ def art_connection(tv: SamsungTVWS):
 def _ensure_tv_connection() -> tuple:
     """Return (art, reconnected) for the current connection, creating one if needed.
 
-    Must only be called while ``_tv_lock`` is held.  If the connection
-    has been idle longer than ``TV_CONN_MAX_IDLE`` seconds it is
+    Runs on the ``_TvWorker`` thread, while ``_tv_lock`` is held.  If the
+    connection has been idle longer than ``TV_CONN_MAX_IDLE`` seconds it is
     proactively closed and reopened — Samsung Frame WebSockets go
     stale after ~30-60 s of inactivity, leading to BrokenPipeError.
 
@@ -215,6 +214,119 @@ def _close_tv_connection():
     _tv_art = None
 
 
+def _interrupt_tv_socket() -> bool:
+    """Force a TV read parked in ``recv`` to raise, from another thread.
+
+    Python can't interrupt a blocked thread, but shutting its socket down
+    makes the pending read fail at once. ``shutdown`` rather than the
+    library's ``close``: close first attempts a graceful close handshake —
+    more blocking I/O, on whichever thread calls it — and then joins the
+    library's listener thread with no timeout.
+
+    Only reaches the main websocket. A transfer parked on a D2D socket
+    (thumbnail fetch, upload) is out of reach; ``_recover_tv_connection``
+    covers that case by replacing the worker instead.
+    """
+    sock = getattr(getattr(_tv_art, "connection", None), "sock", None)
+    if sock is None:
+        return False
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        return False
+    log.debug("Shut down TV socket to unstick a parked read")
+    return True
+
+
+class _TvWorker:
+    """The single thread TV calls run on, owning the connection outright.
+
+    Deliberately not a thread pool. samsungtvws bounds each individual socket
+    read but not the loops around them — ``_wait_for_d2d`` spins until it sees
+    the event it wants, ``_recv_exact`` until every byte arrives — so a chatty
+    or dribbling TV can park a thread indefinitely, and ``asyncio.wait_for``
+    giving up only abandons the await, never the thread. One worker caps that
+    at a single parked thread rather than one per call, and keeps the
+    connection on the only thread that touches it. Daemon, so a parked worker
+    can't hold up interpreter exit the way a ThreadPoolExecutor's non-daemon
+    threads would.
+    """
+
+    def __init__(self) -> None:
+        self.jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self.idle = threading.Event()
+        self.idle.set()
+        threading.Thread(target=self._run, name="tv-worker", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            job, fut = self.jobs.get()
+            self.idle.clear()
+            try:
+                if fut.set_running_or_notify_cancel():
+                    try:
+                        fut.set_result(job())
+                    except BaseException as e:
+                        # BaseException, not Exception: anything that escapes
+                        # belongs to the caller awaiting this future, and
+                        # letting it kill the loop would strand every later job.
+                        fut.set_exception(e)
+            finally:
+                self.idle.set()
+
+    def submit(self, job) -> Future:
+        fut: Future = Future()
+        self.jobs.put((job, fut))
+        return fut
+
+
+# Started on first use and replaced only by _recover_tv_connection, both of
+# which happen on the event loop thread, so no locking is needed around it.
+_tv_worker: _TvWorker | None = None
+
+
+def _submit_tv_job(job) -> Future:
+    global _tv_worker
+    if _tv_worker is None:
+        _tv_worker = _TvWorker()
+    return _tv_worker.submit(job)
+
+
+async def _recover_tv_connection() -> None:
+    """Drop the TV connection after a failed op, without blocking the loop.
+
+    A worker that has merely finished a failing job is quiescent, so the
+    ordinary close applies. One that is still running is parked in a read:
+    shut its socket down and give it a moment to unwind. If it never does it
+    is parked somewhere the interrupt couldn't reach, and gets written off —
+    a fresh worker takes over so TV calls don't queue behind a thread that
+    may never return. The abandoned thread runs on against a socket that has
+    already been shut down under it, and exits once its read finally fails.
+    """
+    global _tv_worker
+    worker = _tv_worker
+    if worker is None or worker.idle.is_set():
+        _close_tv_connection()
+        return
+
+    _interrupt_tv_socket()
+    deadline = time.monotonic() + TV_RECOVER_GRACE
+    while not worker.idle.is_set() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+
+    if worker.idle.is_set():
+        _close_tv_connection()
+        return
+
+    log.error(
+        "TV worker still parked %.0fs after its socket was shut down — "
+        "abandoning that thread and starting a fresh worker",
+        TV_RECOVER_GRACE,
+    )
+    _tv_worker = None
+    _close_tv_connection()
+
+
 def _wake_tv() -> None:
     """Send a Wake-on-LAN magic packet to the TV (no-op if no MAC configured).
 
@@ -244,16 +356,18 @@ def _wake_tv() -> None:
 async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | None = None):
     """Run a blocking TV operation off the event loop, reliably.
 
-    Reuses a persistent TV/art WebSocket connection, running ``fn(art)`` in a
-    worker thread. Access is serialized by ``_tv_lock`` so only one TV
-    conversation happens at a time (the Frame dislikes concurrent
-    connections), while the event loop stays free to serve other requests.
+    Reuses a persistent TV/art WebSocket connection, running ``fn(art)`` on
+    the ``_TvWorker`` thread that owns it. Access is serialized by
+    ``_tv_lock`` so only one TV conversation happens at a time (the Frame
+    dislikes concurrent connections), while the event loop stays free to
+    serve other requests.
 
     Each attempt is bounded by ``timeout`` (default ``TV_TIMEOUT + 8``) so a
     hung connection can never hold the lock forever — it raises and releases.
-    On failure the connection is closed (so the next attempt opens a fresh
-    one), a Wake-on-LAN packet is sent, and the lock is **released** during
-    the retry delay so other operations aren't starved. The delay grows
+    On failure ``_recover_tv_connection`` drops the connection (so the next
+    attempt opens a fresh one) and unsticks or replaces a worker still parked
+    in a read, a Wake-on-LAN packet is sent, and the lock is **released**
+    during the retry delay so other operations aren't starved. The delay grows
     linearly (``TV_RETRY_DELAY * attempt``) since a real Frame TV can take
     several seconds to bring its art-mode service back up after a WoL
     packet — a flat short delay tends to burn attempts before the TV has
@@ -295,8 +409,7 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
             wait_s = time.monotonic() - wait_start
             try:
                 result, reconnected, connect_s, call_s = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(_TV_EXECUTOR, _job),
-                    timeout=timeout,
+                    asyncio.wrap_future(_submit_tv_job(_job)), timeout=timeout
                 )
                 global _tv_last_used
                 _tv_last_used = time.monotonic()
@@ -312,7 +425,7 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
                 raise  # TV answered with a definitive error — retrying won't help
             except Exception as e:
                 last_exc = e
-                _close_tv_connection()
+                await _recover_tv_connection()
         # Lock released — other operations can proceed during retry delay
         if attempt + 1 < attempts:
             delay = TV_RETRY_DELAY * (attempt + 1)

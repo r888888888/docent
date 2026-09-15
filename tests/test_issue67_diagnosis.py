@@ -192,6 +192,7 @@ class TestTvOpTimeoutBehavior:
         opened inside get_thumbnail_list is still alive in the thread.
         """
         monkeypatch.setattr(server, "TV_RETRY_DELAY", 0.01)
+        monkeypatch.setattr(server, "TV_RECOVER_GRACE", 0.1)
 
         close_calls = []
         original_close = server._close_tv_connection
@@ -210,7 +211,7 @@ class TestTvOpTimeoutBehavior:
         ensure_called = []
         def mock_ensure():
             ensure_called.append(True)
-            return MagicMock()
+            return MagicMock(), False
         monkeypatch.setattr(server, "_ensure_tv_connection", mock_ensure)
 
         with pytest.raises(asyncio.TimeoutError):
@@ -243,7 +244,7 @@ class TestConcurrentTvOps:
 
         mock_art = MagicMock()
         def mock_ensure():
-            return mock_art
+            return mock_art, False
         monkeypatch.setattr(server, "_ensure_tv_connection", mock_ensure)
         monkeypatch.setattr(server, "_close_tv_connection", lambda: None)
 
