@@ -1860,7 +1860,11 @@ async def _analyze_artwork(content_id: str) -> dict:
     }
 
     async with _meta_lock:
-        meta = _load_artwork_meta()
+        # _meta_lock also serializes concurrent analyses (analyze-batch runs
+        # several at once) — each holder reloads meta fresh from disk before
+        # patching its own content_id, so concurrent callers can't clobber
+        # each other's writes even though every save is a full-file rewrite.
+        meta = await asyncio.to_thread(_load_artwork_meta)
         if content_id not in meta["artwork"]:
             meta["artwork"][content_id] = {}
         meta["artwork"][content_id]["ai_meta"] = ai_meta
@@ -1875,7 +1879,7 @@ async def _analyze_artwork(content_id: str) -> dict:
             meta["artwork"][content_id]["title"] = display
         elif not current_title:
             meta["artwork"][content_id]["title"] = ai_title
-        _save_artwork_meta(meta)
+        await asyncio.to_thread(_save_artwork_meta, meta)
         saved_title = meta["artwork"][content_id].get("title")
 
     return {"ai_meta": ai_meta, "title": saved_title}
@@ -2118,13 +2122,22 @@ async def analyze_artwork(content_id: str):
     return {"ok": True, "content_id": content_id, "ai_meta": result["ai_meta"], "title": result.get("title")}
 
 
+# How many artworks to analyze concurrently. Each analysis is 1-2 sequential
+# HTTP calls (Vision, then Claude/OpenAI, occasionally an Opus escalation)
+# dominated by network/API latency, not local CPU, so running a few at once
+# is a straightforward win — a batch of 195 at ~8s/item serially takes
+# ~26 minutes; at 3-way concurrency, roughly a third of that. Bounded (not
+# all-at-once) to stay a well-behaved client of the vision/LLM APIs.
+_ANALYZE_BATCH_CONCURRENCY = 3
+
+
 @app.post("/api/ai/analyze-batch")
 async def analyze_batch(body: dict):
     content_ids = body.get("content_ids", [])
     if content_ids:
         _validate_content_ids(content_ids)
     force = body.get("force", False)
-    meta = _load_artwork_meta()
+    meta = await asyncio.to_thread(_load_artwork_meta)
 
     if not content_ids:
         if force:
@@ -2135,22 +2148,29 @@ async def analyze_batch(body: dict):
                 if cid not in {k for k, v in meta.get("artwork", {}).items() if v.get("ai_meta")}
             ]
 
-    analyzed = 0
+    to_analyze = []
     skipped = 0
-    failed = 0
-
     for cid in content_ids:
         existing = meta.get("artwork", {}).get(cid, {}).get("ai_meta")
         if existing and not force:
             skipped += 1
-            continue
-        try:
-            result = await _analyze_artwork(cid)
-            analyzed += 1
-            await asyncio.sleep(1)
-        except Exception as e:
-            log.warning("AI analysis failed for %s: %s", cid, e)
-            failed += 1
+        else:
+            to_analyze.append(cid)
+
+    semaphore = asyncio.Semaphore(_ANALYZE_BATCH_CONCURRENCY)
+
+    async def _analyze_one(cid: str) -> bool:
+        async with semaphore:
+            try:
+                await _analyze_artwork(cid)
+                return True
+            except Exception as e:
+                log.warning("AI analysis failed for %s: %s", cid, e)
+                return False
+
+    results = await asyncio.gather(*(_analyze_one(cid) for cid in to_analyze))
+    analyzed = sum(results)
+    failed = len(results) - analyzed
 
     return {"analyzed": analyzed, "skipped": skipped, "failed": failed, "total": len(content_ids)}
 
